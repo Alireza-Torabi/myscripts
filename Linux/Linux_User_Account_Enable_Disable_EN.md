@@ -385,6 +385,129 @@ sudo chage -l "$USERNAME"
 
 ---
 
+
+# Identifying Disabled User Accounts
+
+Linux does not have one universal account state called `Disabled User`. A user account may be disabled in one or more of the following ways:
+
+- The password is locked.
+- The account is expired.
+- The login shell is set to `nologin` or `false`.
+- A combination of the above is applied.
+
+For accurate results, check all relevant account states.
+
+---
+
+## List Accounts with Locked Passwords
+
+```bash
+sudo passwd -Sa | awk '$2=="L"'
+```
+
+To display usernames only:
+
+```bash
+sudo passwd -Sa | awk '$2=="L" {print $1}'
+```
+
+> This output may also include system accounts.
+
+---
+
+## List Normal Users with Locked Passwords
+
+On many Linux distributions, normal user accounts typically have a UID of `1000` or higher.
+
+```bash
+getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' |
+while read user; do
+    status=$(sudo passwd -S "$user" 2>/dev/null | awk '{print $2}')
+    if [ "$status" = "L" ]; then
+        echo "$user"
+    fi
+done
+```
+
+---
+
+## List Accounts with Disabled Login Shells
+
+To find users whose login shell is set to `nologin` or `false`:
+
+```bash
+getent passwd | awk -F: '$7 ~ /(nologin|false)$/ {print $1, $3, $7}'
+```
+
+Example:
+
+```text
+masoud 1001 /usr/sbin/nologin
+```
+
+---
+
+## Check Account Expiration for a Specific User
+
+```bash
+sudo chage -l masoud
+```
+
+Look for:
+
+```text
+Account expires : ...
+```
+
+---
+
+## Display Full Status for Normal Users
+
+The following command displays password status, account expiration, and login shell for all normal users:
+
+```bash
+getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' |
+while read user; do
+    status=$(sudo passwd -S "$user" 2>/dev/null | awk '{print $2}')
+    expire=$(sudo chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
+    shell=$(getent passwd "$user" | cut -d: -f7)
+
+    printf "%-20s Password=%-3s Expire=%-15s Shell=%s\n" \
+        "$user" "$status" "$expire" "$shell"
+done
+```
+
+Example output:
+
+```text
+reza                 Password=P   Expire=never           Shell=/bin/bash
+masoud               Password=L   Expire=Jan 01, 1970    Shell=/usr/sbin/nologin
+ali                   Password=P   Expire=never           Shell=/bin/bash
+```
+
+In this output:
+
+- `P` means the password is usable.
+- `L` means the password is locked.
+- `Expire=never` means the account does not expire.
+- `/usr/sbin/nologin` means interactive shell login is disabled.
+
+---
+
+## Recommended Indicators of a Fully Disabled Account
+
+If the account was disabled using the full procedure in this runbook, you will typically see:
+
+```text
+Password=L
+Account expired
+Shell=/usr/sbin/nologin
+```
+
+If only the recommended `Lock + Expire` method was used, the login shell may still remain `/bin/bash`.
+
+---
+
 # Practical Recommendation
 
 For **temporarily disabling a normal human user account** while preserving all files and ownership information, the following commands are usually sufficient:
