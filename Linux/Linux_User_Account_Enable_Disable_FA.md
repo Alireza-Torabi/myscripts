@@ -563,3 +563,169 @@ sudo usermod -s /usr/sbin/nologin "$USERNAME"
 حذف کاربر با `userdel` فقط زمانی منطقی است که واقعاً قصد حذف Account را داشته باشید و سیاست نگهداری اطلاعات سازمان اجازه آن را بدهد.
 
 </div>
+
+
+<div dir="rtl" align="right">
+
+# شناسایی کاربران غیرفعال
+
+در Linux یک وضعیت واحد به نام `Disabled User` وجود ندارد. یک حساب ممکن است به یکی یا چند روش زیر غیرفعال شده باشد:
+
+- Password حساب Lock شده باشد.
+- Account منقضی (Expired) شده باشد.
+- Login Shell روی `nologin` یا `false` تنظیم شده باشد.
+- ترکیبی از موارد بالا اعمال شده باشد.
+
+به همین دلیل برای شناسایی دقیق کاربران غیرفعال باید چند وضعیت را هم‌زمان بررسی کرد.
+
+---
+
+## مشاهده حساب‌هایی که Password آن‌ها Lock شده است
+
+</div>
+
+```bash
+sudo passwd -Sa | awk '$2=="L"'
+```
+
+<div dir="rtl" align="right">
+
+برای نمایش فقط نام کاربران:
+
+</div>
+
+```bash
+sudo passwd -Sa | awk '$2=="L" {print $1}'
+```
+
+<div dir="rtl" align="right">
+
+> این خروجی ممکن است شامل System Accountها نیز باشد.
+
+---
+
+## مشاهده کاربران عادی با Password Lock شده
+
+در بسیاری از توزیع‌های Linux، کاربران عادی معمولاً UID برابر یا بزرگ‌تر از `1000` دارند.
+
+</div>
+
+```bash
+getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' |
+while read user; do
+    status=$(sudo passwd -S "$user" 2>/dev/null | awk '{print $2}')
+    if [ "$status" = "L" ]; then
+        echo "$user"
+    fi
+done
+```
+
+<div dir="rtl" align="right">
+
+---
+
+## مشاهده حساب‌هایی که Shell آن‌ها غیرفعال است
+
+برای پیدا کردن حساب‌هایی که Login Shell آن‌ها روی `nologin` یا `false` تنظیم شده است:
+
+</div>
+
+```bash
+getent passwd | awk -F: '$7 ~ /(nologin|false)$/ {print $1, $3, $7}'
+```
+
+<div dir="rtl" align="right">
+
+مثال:
+
+</div>
+
+```text
+masoud 1001 /usr/sbin/nologin
+```
+
+<div dir="rtl" align="right">
+
+---
+
+## بررسی Expiration یک کاربر مشخص
+
+</div>
+
+```bash
+sudo chage -l masoud
+```
+
+<div dir="rtl" align="right">
+
+به مقدار زیر توجه کنید:
+
+</div>
+
+```text
+Account expires : ...
+```
+
+<div dir="rtl" align="right">
+
+---
+
+## نمایش وضعیت کامل کاربران عادی
+
+دستور زیر وضعیت Password، تاریخ Expiration و Shell تمام کاربران عادی را در یک خروجی نمایش می‌دهد:
+
+</div>
+
+```bash
+getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' |
+while read user; do
+    status=$(sudo passwd -S "$user" 2>/dev/null | awk '{print $2}')
+    expire=$(sudo chage -l "$user" 2>/dev/null | awk -F': ' '/Account expires/{print $2}')
+    shell=$(getent passwd "$user" | cut -d: -f7)
+
+    printf "%-20s Password=%-3s Expire=%-15s Shell=%s\n" \
+        "$user" "$status" "$expire" "$shell"
+done
+```
+
+<div dir="rtl" align="right">
+
+نمونه خروجی:
+
+</div>
+
+```text
+reza                 Password=P   Expire=never           Shell=/bin/bash
+masoud               Password=L   Expire=Jan 01, 1970    Shell=/usr/sbin/nologin
+ali                   Password=P   Expire=never           Shell=/bin/bash
+```
+
+<div dir="rtl" align="right">
+
+در این مثال:
+
+- `P` یعنی Password قابل استفاده است.
+- `L` یعنی Password Lock شده است.
+- `Expire=never` یعنی حساب منقضی نشده است.
+- `/usr/sbin/nologin` یعنی Login تعاملی از طریق Shell غیرفعال است.
+
+---
+
+## وضعیت پیشنهادی برای تشخیص یک حساب کاملاً غیرفعال
+
+اگر طبق روش این Runbook حساب را غیرفعال کرده باشید، معمولاً این سه وضعیت را خواهید دید:
+
+</div>
+
+```text
+Password=L
+Account expired
+Shell=/usr/sbin/nologin
+```
+
+<div dir="rtl" align="right">
+
+البته اگر فقط از روش پیشنهادی `Lock + Expire` استفاده کرده باشید، ممکن است Shell همچنان `/bin/bash` باقی مانده باشد.
+
+---
+</div>
