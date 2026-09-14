@@ -3,9 +3,9 @@
 This guide explains how to prepare, run, verify, and troubleshoot `ssh_access_check.sh` on Linux.
 
 **Type:** How-to Guide  
-**Version:** 1.0.0  
+**Version:** 1.2.0  
 **Status:** Active  
-**Last Updated:** 2026-09-13  
+**Last Updated:** 2026-09-14  
 **Environment:** Linux
 
 ## 1. Prepare the Files
@@ -106,6 +106,14 @@ exit
 ./ssh_access_check.sh
 ```
 
+### Plain Output Mode
+
+To disable the live dashboard and use normal line-by-line output:
+
+```bash
+./ssh_access_check.sh --plain ips.txt
+```
+
 The script will then ask:
 
 ```text
@@ -174,6 +182,20 @@ Enter the connection timeout in seconds [8]: 15
 
 Avoid unnecessarily large timeout values because unreachable hosts will make the complete scan take significantly longer.
 
+## 9A. Select the Number of Concurrent Workers
+
+The default is `5` parallel SSH workers:
+
+```text
+Enter the number of concurrent SSH workers [5]:
+```
+
+Press `Enter` to use the recommended default.
+
+Parallel workers reduce total scan time, but increasing the value also increases simultaneous authentication attempts. High values can trigger account-lockout policies, SSH rate limits, IDS/IPS controls, or transient connection failures. Start with `5` unless the environment is known to tolerate more.
+
+The workers may finish in a different order, but the generated CSV always preserves the exact original order of the target list.
+
 ## 10. Select the CSV Output Filename
 
 The script generates a timestamped filename automatically:
@@ -194,34 +216,29 @@ The parent directory must already exist.
 
 ## 11. Monitor the Test
 
-The script displays each target as it is processed.
+By default, the script displays a live dashboard with:
 
-Successful authentication appears as:
+- Overall progress and percentage.
+- Configured and currently running workers.
+- Accessible, failed, and remaining target counts.
+- Elapsed time.
+- Recent worker results.
 
-```text
-[TEST] [1/4] Testing 192.168.10.10:22 as admin
-[ACCESS OK] 192.168.10.10
-```
-
-Authentication failure appears as:
-
-```text
-[TEST] [2/4] Testing 192.168.10.11:22 as admin
-[ACCESS FAILED] 192.168.10.11 - AUTHENTICATION_FAILED
-[DETAIL] admin@192.168.10.11: Permission denied (password).
-```
-
-Connection failure may appear as:
+Example:
 
 ```text
-[ACCESS FAILED] 192.168.10.12 - CONNECTION_REFUSED
+SSH ACCESS CHECKER v1.2.0 | PARALLEL LIVE DASHBOARD
+----------------------------------------------------------------------------------------------------
+Workers: 5    Running: 5    CSV order: Input order
+Progress: [####################----------------------------] 42% (42/100)
+Accessible: 15     Failed: 27     Remaining: 58
+----------------------------------------------------------------------------------------------------
+RECENT ACTIVITY (completion order; CSV remains in input order)
 ```
 
-An unreachable or filtered system may result in:
+The dashboard is periodically redrawn while the scan runs. This is expected. If this behavior is not desired, run the script with `--plain`.
 
-```text
-[ACCESS FAILED] 192.168.10.20 - TIMEOUT
-```
+The `RECENT ACTIVITY` section shows the actual worker completion order, which may not match the source file order. This does not affect the CSV.
 
 ## 12. Review the Final Summary
 
@@ -231,11 +248,17 @@ After all targets are processed, the script prints a summary similar to:
 =============================================
                FINAL SUMMARY
 =============================================
-Total targets : 4
+Targets found : 4
+Targets tested: 4
+Workers used  : 4
 Accessible    : 1
 Not accessible: 3
+Elapsed time  : 00:00:08
+CSV ordering  : Input order preserved
 
-[SUCCESS] Results saved to: ssh_access_results_20260913_113000.csv
+[SUCCESS] All targets were processed.
+[SUCCESS] CSV order exactly matches the input target order.
+[SUCCESS] Results saved to: ssh_access_results_20260914_113000.csv
 ```
 
 ## 13. Review the CSV File
@@ -251,6 +274,8 @@ For easier terminal viewing:
 ```bash
 column -s, -t < ssh_access_results_20260913_113000.csv
 ```
+
+The CSV rows always follow the exact input-file order, regardless of the order in which parallel workers complete.
 
 Example CSV:
 
@@ -276,6 +301,11 @@ The file can also be opened in Excel, LibreOffice Calc, Google Sheets, or anothe
 | `DNS_ERROR` | Hostname resolution failed. | Check DNS or use the IP address. |
 | `HOST_KEY_ERROR` | SSH host-key verification failed. | Investigate the host identity before retrying. |
 | `CONNECTION_CLOSED` | Remote host closed/reset the connection. | Check SSH server logs and security controls. |
+| `SSH_NEGOTIATION_FAILED` | SSH algorithm negotiation failed. | Compare supported SSH algorithms on the client and server. |
+| `SSH_PROTOCOL_ERROR` | SSH handshake or protocol negotiation failed. | Check the remote service and SSH server logs. |
+| `SSH_CLIENT_ERROR` | Local SSH client configuration/option error. | Review local SSH configuration and options. |
+| `SSHPASS_ERROR` | `sshpass` could not parse the SSH response. | Review the target SSH behavior and client output. |
+| `WORKER_ERROR` | A parallel worker ended without a normal result. | Retry the target and inspect the local environment. |
 | `SSH_ERROR` | Unclassified SSH failure. | Review the displayed SSH error detail. |
 
 ## 15. Automatic Dependency Installation
@@ -432,7 +462,7 @@ Do not place passwords in:
 
 The password is requested interactively and is not intentionally persisted by the script.
 
-If a shared or centralized account is subject to lockout rules, do not repeatedly test a known-invalid password against a large host list.
+If a shared or centralized account is subject to lockout rules, do not repeatedly test a known-invalid password against a large host list. Parallel workers can reach the lockout threshold faster, so verify the credential first and use conservative worker counts.
 
 ## 18. Suggested Git Usage
 
@@ -485,5 +515,7 @@ Before running against a production inventory:
 4. Confirm the generated CSV is correct.
 5. Verify account-lockout policy for the SSH account.
 6. Confirm that the scan is authorized for the target environment.
+7. Start with the default `5` workers and increase concurrency only after confirming that authentication, SSH rate limits, and security controls are not being triggered.
+8. Confirm that the final CSV order matches the original target-file order.
 
 After these checks, run the larger target list.
