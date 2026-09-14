@@ -3,15 +3,15 @@
 A Bash utility for testing SSH username/password access against a list of Linux hosts and exporting the results to CSV.
 
 **Type:** Repository README  
-**Version:** 1.0.0  
+**Version:** 1.2.0  
 **Status:** Active  
-**Last Updated:** 2026-09-13  
+**Last Updated:** 2026-09-14  
 **Environment:** Linux  
 **License:** <LICENSE>
 
 ## Overview
 
-`ssh_access_check.sh` reads a list of IP addresses or hostnames, prompts for SSH credentials, tests each target, displays color-coded status messages, and writes the final results to a CSV file.
+`ssh_access_check.sh` reads a list of IP addresses or hostnames, prompts for SSH credentials, tests targets with controlled parallel SSH workers, displays a live terminal dashboard, and writes the final results to a CSV file in the exact original input order.
 
 The script is designed for system administrators who need to verify whether the same SSH account can authenticate to multiple Linux systems.
 
@@ -26,6 +26,7 @@ The script is designed for system administrators who need to verify whether the 
   - SSH password
   - SSH port
   - Connection timeout
+  - Number of concurrent SSH workers
   - CSV output filename
 - Hides the password while it is entered.
 - Checks required dependencies before execution.
@@ -39,7 +40,10 @@ The script is designed for system administrators who need to verify whether the 
   - `apk`
 - Disables public-key authentication during the test so the supplied username/password is actually validated.
 - Uses a temporary `known_hosts` file instead of modifying the user's normal SSH configuration.
-- Shows color-coded status messages in the terminal.
+- Shows a K9s-inspired live terminal dashboard with progress, worker count, elapsed time, and recent activity.
+- Supports `--plain` mode for normal line-by-line output.
+- Uses controlled parallel SSH workers to reduce total scan time.
+- Preserves the exact original target order in the CSV even when workers finish out of order.
 - Distinguishes common failure types such as:
   - Authentication failure
   - Connection refused
@@ -132,6 +136,7 @@ Enter the SSH username:
 Enter the SSH password:
 Enter the SSH port [22]:
 Enter the connection timeout in seconds [8]:
+Enter the number of concurrent SSH workers [5]:
 Enter the output CSV filename [ssh_access_results_YYYYMMDD_HHMMSS.csv]:
 ```
 
@@ -139,25 +144,27 @@ The password is not displayed while typing.
 
 ## Example Terminal Output
 
+The default mode uses a live dashboard similar to:
+
 ```text
-[INFO] Targets found: 4
-
---------------------------------------------------
-[TEST] [1/4] Testing 192.168.10.10:22 as admin
-[ACCESS OK] 192.168.10.10
-
---------------------------------------------------
-[TEST] [2/4] Testing 192.168.10.11:22 as admin
-[ACCESS FAILED] 192.168.10.11 - AUTHENTICATION_FAILED
-
---------------------------------------------------
-[TEST] [3/4] Testing 192.168.10.12:22 as admin
-[ACCESS FAILED] 192.168.10.12 - CONNECTION_REFUSED
-
---------------------------------------------------
-[TEST] [4/4] Testing 192.168.10.20:22 as admin
-[ACCESS FAILED] 192.168.10.20 - TIMEOUT
+SSH ACCESS CHECKER v1.2.0 | PARALLEL LIVE DASHBOARD
+----------------------------------------------------------------------------------------------------
+User: admin                  Port: 22    Timeout: 8s    Elapsed: 00:00:18
+Workers: 5    Running: 5    CSV order: Input order
+Input: ips.txt                            Output: ssh_access_results.csv
+----------------------------------------------------------------------------------------------------
+Progress: [####################----------------------------] 42% (42/100)
+Accessible: 15     Failed: 27     Remaining: 58
+----------------------------------------------------------------------------------------------------
+RECENT ACTIVITY (completion order; CSV remains in input order)
+#     TARGET                 RESULT                      DETAIL
+----- ---------------------- --------------------------- -------------------------------
+39    192.168.10.39          ACCESS_OK                   Login successful
+42    192.168.10.42          TIMEOUT                     Connection or authentication...
+40    192.168.10.40          AUTHENTICATION_FAILED       Password authentication rejected
 ```
+
+The dashboard is periodically redrawn while the scan is running. This is expected behavior. Use `--plain` if a continuously redrawn terminal UI is not desired.
 
 ## CSV Output
 
@@ -166,6 +173,8 @@ The generated CSV contains the following columns:
 ```text
 Target,Port,Username,Access,Result,TestedAt
 ```
+
+Rows are written in the same order as the targets in the input file, even when parallel workers complete in a different order.
 
 Example:
 
@@ -189,6 +198,11 @@ Target,Port,Username,Access,Result,TestedAt
 | `DNS_ERROR` | The supplied hostname could not be resolved. |
 | `HOST_KEY_ERROR` | SSH host-key verification failed. |
 | `CONNECTION_CLOSED` | The remote side closed or reset the SSH connection. |
+| `SSH_NEGOTIATION_FAILED` | SSH algorithm negotiation failed. |
+| `SSH_PROTOCOL_ERROR` | SSH handshake or protocol negotiation failed. |
+| `SSH_CLIENT_ERROR` | The local SSH client reported a configuration or option error. |
+| `SSHPASS_ERROR` | `sshpass` could not parse the SSH response. |
+| `WORKER_ERROR` | A parallel worker terminated without producing a normal result. |
 | `SSH_ERROR` | SSH failed for a reason that did not match one of the known classifications. |
 
 ## Security Considerations
@@ -208,7 +222,7 @@ Do not:
 
 If the same account is managed by LDAP, Active Directory, PAM, or another centralized authentication system, repeated failed authentication attempts can trigger an account lockout policy.
 
-Verify the credentials on a known system before testing a large target list.
+Verify the credentials on a known system before testing a large target list. Parallel workers can reach an account-lockout threshold faster than sequential execution, so start with the default value of `5` unless the authentication and security policies are known.
 
 ### Password Authentication
 
@@ -228,12 +242,14 @@ The script uses a temporary `known_hosts` file. New host keys can be accepted fo
 - It does not automatically discover hosts on a network.
 - Package installation depends on the repositories configured on the local Linux system.
 - Network firewalls, ACLs, IDS/IPS systems, rate limits, and SSH server policies can affect the result.
+- High worker counts can increase transient failures or trigger rate limiting and account-lockout controls.
+- The dashboard recent-activity list is shown in worker completion order; the CSV remains in original input order.
 
 ## Recommended Usage
 
-For small and medium target lists, the default sequential execution is simple and predictable.
+The default value of `5` concurrent workers is the recommended starting point for small and medium inventories. It normally provides a meaningful speed improvement without creating aggressive connection pressure.
 
-For very large inventories, running many authentication attempts in parallel should be approached carefully. Parallel execution can cause unnecessary load, trigger security controls, or increase account-lockout risk.
+Increase concurrency carefully. Higher worker counts can trigger SSH rate limits, IDS/IPS controls, or centralized account-lockout policies, especially when credentials are invalid. Values above `10` should be used only when the environment and authentication policies are understood.
 
 ## Troubleshooting
 
