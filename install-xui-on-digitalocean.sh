@@ -200,6 +200,9 @@ Inbound snapshot:
 Generated inbound JSON:
 /opt/x-ui/generated-inbounds/
 
+Subscription QR PNG:
+/opt/x-ui/subscription-qr.png
+
 Bootstrap log:
 /var/log/x-ui-bootstrap.log
 
@@ -247,7 +250,7 @@ if [[ -n "${SSH_CONNECTION:-}" && $- == *i* ]]; then
       echo
 
       if command -v qrencode >/dev/null 2>&1; then
-        qrencode -t ANSIUTF8 -m 1 "$SUBSCRIPTION_URL"
+        qrencode -t ANSI256 -m 4 -l M "$SUBSCRIPTION_URL"
       else
         echo "qrencode is not installed."
       fi
@@ -266,7 +269,7 @@ if [[ -n "${SSH_CONNECTION:-}" && $- == *i* ]]; then
   echo "  cat /opt/x-ui/credentials.env"
   echo "  cat /opt/x-ui/client-info.env"
   echo "  cat /opt/x-ui/inbounds.json"
-  echo '  source /opt/x-ui/client-info.env && qrencode -t ANSIUTF8 -m 1 "$SUBSCRIPTION_URL"'
+  echo '  source /opt/x-ui/client-info.env && qrencode -t ANSI256 -m 4 -l M "$SUBSCRIPTION_URL"'
   echo "  tail -n 200 /var/log/x-ui-bootstrap.log"
   echo "  systemctl status x-ui"
   echo "  x-ui"
@@ -771,6 +774,13 @@ CLIENTEOF
 chmod 600 "$RESULT_DIR/client-info.env"
 chown root:root "$RESULT_DIR/client-info.env"
 
+# Generate a standard black/white PNG QR code for reliable mobile scanning.
+# Margin 4 is the standard quiet zone; error correction M improves camera scanning.
+qrencode -t PNG -m 4 -s 10 -l M -o "$QR_PNG" "$SUBSCRIPTION_URL" \
+  || die "Failed to generate subscription QR PNG"
+chmod 600 "$QR_PNG"
+chown root:root "$QR_PNG"
+
 log "[18/18] Final validation"
 FINAL_LIST="$(api_get "/panel/api/inbounds/list")" || die "Final inbound list failed"
 FINAL_EXPECTED_COUNT="$(echo "$FINAL_LIST" | jq '[.obj[]? | select(.remark=="insecure" or .remark=="Vless-Reality-Row" or .remark=="Vless-Xhttp" or .remark=="Vless-Reality-gRPC")] | length')"
@@ -804,4 +814,5 @@ echo
 echo "Panel info: /opt/x-ui/panel-info.txt"
 echo "Credentials: /opt/x-ui/credentials.env"
 echo "Client info: /opt/x-ui/client-info.env"
+echo "Subscription QR PNG: /opt/x-ui/subscription-qr.png"
 echo "Log: /var/log/x-ui-bootstrap.log"
