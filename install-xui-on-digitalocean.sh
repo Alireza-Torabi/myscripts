@@ -5,26 +5,33 @@ set -uo pipefail
 # ============================================================
 # 3x-ui DigitalOcean Bootstrap
 #
-# Creates:
+# Flow:
 #
-#   1) insecure
-#      VLESS / TCP / none
-#      Port 10253
+#   1. Install dependencies
+#   2. Detect DigitalOcean public IP
+#   3. Install 3x-ui WITHOUT SSL
+#   4. Save credentials immediately
+#   5. Create SSH login banner immediately
+#   6. Install/verify acme.sh
+#   7. Issue Let's Encrypt short-lived IP certificate
+#   8. Configure certificate for panel
+#   9. Configure same certificate for subscription server
+#  10. Restart x-ui
+#  11. Authenticate API
+#  12. Generate REALITY keys
+#  13. Create 4 inbounds
+#  14. Create shared Friend client
+#  15. Build/test Friend subscription URL
+#  16. Final validation
 #
-#   2) Vless-Reality-Row
-#      VLESS / TCP / REALITY
-#      Port 443
 #
-#   3) Vless-Xhttp
-#      VLESS / XHTTP / REALITY
-#      Port 2052
+# Inbounds:
 #
-#   4) Vless-Reality-gRPC
-#      VLESS / gRPC / REALITY
-#      Port 17667
+#   10253  VLESS / TCP   / none
+#   443    VLESS / TCP   / REALITY / Samsung
+#   2052   VLESS / XHTTP / REALITY / Docker
+#   17667  VLESS / gRPC  / REALITY / k8s
 #
-# Shared client:
-#   Friend
 #
 # Outputs:
 #
@@ -34,11 +41,8 @@ set -uo pipefail
 #   /opt/x-ui/inbounds.json
 #   /opt/x-ui/generated-inbounds/
 #
-# SSH login banner:
 #
-#   /etc/profile.d/x-ui-login-info.sh
-#
-# Main log:
+# Log:
 #
 #   /var/log/x-ui-bootstrap.log
 #
@@ -46,10 +50,11 @@ set -uo pipefail
 
 
 # ============================================================
-# GLOBAL CONFIG
+# GLOBAL SETTINGS
 # ============================================================
 
 export DEBIAN_FRONTEND=noninteractive
+export HOME=/root
 
 RESULT_DIR="/opt/x-ui"
 GENERATED_DIR="${RESULT_DIR}/generated-inbounds"
@@ -64,10 +69,18 @@ DB_FILE="/etc/x-ui/x-ui.db"
 
 COOKIE_JAR="${RESULT_DIR}/api-cookie.txt"
 
+CERT_DIR="/root/cert/ip"
 
-# ------------------------------------------------------------
-# Friend client
-# ------------------------------------------------------------
+CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
+
+CERT_PRIVATE="${CERT_DIR}/privkey.pem"
+
+ACME="/root/.acme.sh/acme.sh"
+
+
+# ============================================================
+# CLIENT SETTINGS
+# ============================================================
 
 CLIENT_EMAIL="Friend"
 
@@ -82,13 +95,15 @@ CLIENT_PASSWORD="r0fc66v4g127l40t"
 CLIENT_TOTAL_BYTES="1073741824000"
 
 
-# ------------------------------------------------------------
-# Runtime state
-# ------------------------------------------------------------
+# ============================================================
+# RUNTIME STATE
+# ============================================================
 
 BOOTSTRAP_STATUS="STARTING"
 
 CONFIG_STATUS="NOT_STARTED"
+
+SSL_STATUS="NOT_STARTED"
 
 SUBSCRIPTION_URL="NOT_AVAILABLE"
 
@@ -99,6 +114,8 @@ PUBLIC_IP="UNKNOWN"
 AUTH_MODE="unknown"
 
 CSRF_TOKEN=""
+
+PANEL_URL="UNKNOWN"
 
 
 mkdir -p "$RESULT_DIR"
@@ -112,7 +129,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# HELPERS
 # ============================================================
 
 log()
@@ -131,7 +148,7 @@ die()
     echo "FATAL ERROR:"
     echo "$*"
     echo
-    echo "Log:"
+    echo "See:"
     echo "$LOG_FILE"
     echo
 
@@ -187,6 +204,24 @@ get_setting()
 }
 
 
+set_setting()
+{
+    local key="$1"
+    local value="$2"
+
+    if [[ ! -f "$DB_FILE" ]]; then
+        return 1
+    fi
+
+    sqlite3 "$DB_FILE" "
+        INSERT INTO settings (key,value)
+        VALUES ('$key','$value')
+        ON CONFLICT(key)
+        DO UPDATE SET value=excluded.value;
+    "
+}
+
+
 write_panel_info()
 {
     cat > "$RESULT_DIR/panel-info.txt" <<EOF
@@ -199,6 +234,9 @@ ${BOOTSTRAP_STATUS}
 
 Configuration Status:
 ${CONFIG_STATUS}
+
+SSL Status:
+${SSL_STATUS}
 
 
 ============================================================
@@ -214,7 +252,8 @@ ${PUBLIC_IP}
 ============================================================
 
 Panel URL:
-${XUI_ACCESS_URL:-UNKNOWN}
+
+${PANEL_URL}
 
 Username:
 ${XUI_USERNAME:-UNKNOWN}
@@ -227,6 +266,19 @@ ${XUI_PANEL_PORT:-UNKNOWN}
 
 Panel Base Path:
 ${XUI_WEB_BASE_PATH:-UNKNOWN}
+
+
+============================================================
+                     TLS CERTIFICATE
+============================================================
+
+Certificate:
+
+${CERT_FULLCHAIN}
+
+Private Key:
+
+${CERT_PRIVATE}
 
 
 ============================================================
@@ -392,7 +444,9 @@ Original installer result:
 
 ============================================================
 Last Updated:
+
 $(date)
+
 ============================================================
 EOF
 
@@ -438,8 +492,10 @@ if [[ -n "${SSH_CONNECTION:-}" && $- == *i* ]]; then
     echo
     echo "################################################################"
     echo
+
     echo "Useful commands:"
     echo
+
     echo "  cat /opt/x-ui/panel-info.txt"
     echo "  cat /opt/x-ui/credentials.env"
     echo "  cat /opt/x-ui/client-info.env"
@@ -447,6 +503,7 @@ if [[ -n "${SSH_CONNECTION:-}" && $- == *i* ]]; then
     echo "  tail -n 200 /var/log/x-ui-bootstrap.log"
     echo "  systemctl status x-ui"
     echo "  x-ui"
+
     echo
     echo "################################################################"
     echo
@@ -455,6 +512,7 @@ fi
 EOF
 
     chmod 755 "$LOGIN_SCRIPT"
+
     chown root:root "$LOGIN_SCRIPT"
 }
 
@@ -470,8 +528,8 @@ api_get_bearer()
     curl \
         -k \
         -sS \
-        --connect-timeout 2 \
-        --max-time 8 \
+        --connect-timeout 3 \
+        --max-time 10 \
         -H "Authorization: Bearer ${XUI_API_TOKEN}" \
         "${API_BASE}${uri}"
 }
@@ -502,8 +560,8 @@ api_get_session()
     curl \
         -k \
         -sS \
-        --connect-timeout 2 \
-        --max-time 8 \
+        --connect-timeout 3 \
+        --max-time 10 \
         -b "$COOKIE_JAR" \
         "${API_BASE}${uri}"
 }
@@ -533,13 +591,9 @@ api_get()
     local uri="$1"
 
     if [[ "$AUTH_MODE" == "bearer" ]]; then
-
         api_get_bearer "$uri"
-
     else
-
         api_get_session "$uri"
-
     fi
 }
 
@@ -550,13 +604,9 @@ api_post()
     local body="$2"
 
     if [[ "$AUTH_MODE" == "bearer" ]]; then
-
         api_post_bearer "$uri" "$body"
-
     else
-
         api_post_session "$uri" "$body"
-
     fi
 }
 
@@ -572,11 +622,11 @@ date
 
 
 # ============================================================
-# STEP 1
-# NETWORK
+# 1. NETWORK
 # ============================================================
 
-log "[1/15] Waiting for network"
+log "[1/18] Waiting for network"
+
 
 NETWORK_OK=0
 
@@ -612,11 +662,10 @@ echo "Network OK."
 
 
 # ============================================================
-# STEP 2
-# DEPENDENCIES
+# 2. DEPENDENCIES
 # ============================================================
 
-log "[2/15] Installing dependencies"
+log "[2/18] Installing dependencies"
 
 
 apt-get update -y \
@@ -631,15 +680,16 @@ apt-get install -y \
     openssl \
     uuid-runtime \
     iproute2 \
+    socat \
+    cron \
     || die "Dependency installation failed."
 
 
 # ============================================================
-# STEP 3
-# PUBLIC IP
+# 3. PUBLIC IP
 # ============================================================
 
-log "[3/15] Detecting DigitalOcean public IPv4"
+log "[3/18] Detecting DigitalOcean public IPv4"
 
 
 PUBLIC_IP="$(get_public_ip)"
@@ -657,18 +707,22 @@ echo "$PUBLIC_IP"
 
 
 # ============================================================
-# STEP 4
-# INSTALL 3x-ui
+# 4. INSTALL 3x-ui WITHOUT SSL
 # ============================================================
 
-log "[4/15] Installing 3x-ui"
+log "[4/18] Installing 3x-ui WITHOUT SSL"
 
 
 export XUI_NONINTERACTIVE=1
 
 export XUI_DB_TYPE="sqlite"
 
-export XUI_SSL_MODE="ip"
+# IMPORTANT:
+# SSL is intentionally disabled during installer execution.
+#
+# We configure SSL ourselves AFTER installation to avoid
+# the cloud-init/acme.sh race condition.
+export XUI_SSL_MODE="none"
 
 
 curl \
@@ -683,6 +737,7 @@ chmod 700 /tmp/install-x-ui.sh
 
 bash /tmp/install-x-ui.sh
 
+
 INSTALL_RC=$?
 
 
@@ -694,11 +749,10 @@ fi
 
 
 # ============================================================
-# STEP 5
-# VERIFY INSTALL
+# 5. VERIFY INSTALLATION
 # ============================================================
 
-log "[5/15] Verifying basic installation"
+log "[5/18] Verifying x-ui installation"
 
 
 if [[ ! -f "$OFFICIAL_RESULT" ]]; then
@@ -724,11 +778,10 @@ echo "x-ui service is running."
 
 
 # ============================================================
-# STEP 6
-# LOAD CREDENTIALS
+# 6. LOAD AND SAVE CREDENTIALS
 # ============================================================
 
-log "[6/15] Saving panel credentials"
+log "[6/18] Loading panel credentials"
 
 
 # shellcheck disable=SC1090
@@ -744,43 +797,18 @@ install \
     || die "Could not save credentials.env."
 
 
-PANEL_SCHEME="${XUI_ACCESS_URL%%://*}"
-
 WEB_PATH="${XUI_WEB_BASE_PATH#/}"
 WEB_PATH="${WEB_PATH%/}"
 
 
-if [[ -n "$WEB_PATH" ]]; then
-
-    API_BASE="${PANEL_SCHEME}://127.0.0.1:${XUI_PANEL_PORT}/${WEB_PATH}"
-
-else
-
-    API_BASE="${PANEL_SCHEME}://127.0.0.1:${XUI_PANEL_PORT}"
-
-fi
-
-
-echo "Panel URL:"
-echo "$XUI_ACCESS_URL"
-
-echo
-
-echo "Local API base:"
-echo "$API_BASE"
-
-
-# ============================================================
-# STEP 7
-# CREATE PANEL INFO + SSH BANNER IMMEDIATELY
-# ============================================================
-
-log "[7/15] Creating recovery information and SSH login banner"
-
-
 BOOTSTRAP_STATUS="PANEL_INSTALLED"
 
-CONFIG_STATUS="PENDING"
+CONFIG_STATUS="WAITING_FOR_SSL"
+
+SSL_STATUS="PENDING"
+
+
+PANEL_URL="http://${PUBLIC_IP}:${XUI_PANEL_PORT}/${WEB_PATH}"
 
 
 write_panel_info
@@ -788,21 +816,364 @@ write_panel_info
 create_login_banner
 
 
-echo "Created:"
-echo "$RESULT_DIR/panel-info.txt"
+# ============================================================
+# 7. INSTALL / VERIFY acme.sh
+# ============================================================
+
+log "[7/18] Installing and verifying acme.sh"
+
+
+if [[ ! -x "$ACME" ]]; then
+
+    echo "acme.sh not found."
+
+    echo "Installing acme.sh..."
+
+
+    curl \
+        -fsSL \
+        https://get.acme.sh \
+        -o /tmp/install-acme.sh \
+        || die "Could not download acme.sh installer."
+
+
+    chmod 700 /tmp/install-acme.sh
+
+
+    bash /tmp/install-acme.sh
+
+
+    ACME_INSTALL_RC=$?
+
+
+    if [[ "$ACME_INSTALL_RC" -ne 0 ]]; then
+
+        SSL_STATUS="FAILED: acme.sh installer"
+
+        CONFIG_STATUS="FAILED"
+
+        write_panel_info
+
+        die "acme.sh installer failed."
+
+    fi
+
+fi
+
+
+# ------------------------------------------------------------
+# Wait until acme.sh really exists.
+#
+# This is the critical fix for the race we observed.
+# ------------------------------------------------------------
+
+ACME_READY=0
+
+
+for i in $(seq 1 30); do
+
+    if [[ -x "$ACME" ]]; then
+
+        ACME_READY=1
+        break
+
+    fi
+
+    sleep 1
+
+done
+
+
+if [[ "$ACME_READY" -ne 1 ]]; then
+
+    SSL_STATUS="FAILED: acme.sh executable missing"
+
+    CONFIG_STATUS="FAILED"
+
+    write_panel_info
+
+    die "$ACME does not exist after installation."
+
+fi
+
+
+echo "acme.sh verified:"
+echo "$ACME"
+
+
+"$ACME" --version \
+    || die "acme.sh cannot execute."
+
+
+# ============================================================
+# 8. PREPARE ACME
+# ============================================================
+
+log "[8/18] Preparing Let's Encrypt IP certificate"
+
+
+mkdir -p "$CERT_DIR"
+
+chmod 700 "$CERT_DIR"
+
+
+# ------------------------------------------------------------
+# Verify port 80 is not already occupied locally.
+# ------------------------------------------------------------
+
+if ss -lnt |
+    grep -q ':80[[:space:]]'
+then
+
+    echo "WARNING:"
+    echo "TCP/80 already has a local listener."
+
+    echo
+    ss -lntp |
+        grep ':80[[:space:]]' \
+        || true
+
+    echo
+    echo "Standalone ACME validation requires local port 80."
+    echo
+
+    SSL_STATUS="FAILED: local port 80 occupied"
+
+    CONFIG_STATUS="FAILED"
+
+    write_panel_info
+
+    exit 1
+
+fi
+
+
+echo "Local TCP/80 is free."
+
+
+# ------------------------------------------------------------
+# Select Let's Encrypt.
+# ------------------------------------------------------------
+
+"$ACME" \
+    --set-default-ca \
+    --server letsencrypt \
+    --force \
+    >/dev/null 2>&1 \
+    || true
+
+
+# ============================================================
+# 9. ISSUE IP CERTIFICATE
+# ============================================================
+
+log "[9/18] Issuing Let's Encrypt short-lived IP certificate"
+
+
+# ------------------------------------------------------------
+# Remove failed old issuance state if this script was retried.
+# ------------------------------------------------------------
+
+rm -rf "/root/.acme.sh/${PUBLIC_IP}" \
+       "/root/.acme.sh/${PUBLIC_IP}_ecc" \
+       2>/dev/null \
+       || true
+
+
+"$ACME" \
+    --issue \
+    -d "$PUBLIC_IP" \
+    --standalone \
+    --server letsencrypt \
+    --certificate-profile shortlived \
+    --days 6 \
+    --httpport 80 \
+    --force
+
+
+CERT_ISSUE_RC=$?
+
+
+if [[ "$CERT_ISSUE_RC" -ne 0 ]]; then
+
+    SSL_STATUS="FAILED: certificate issuance"
+
+    CONFIG_STATUS="FAILED"
+
+    write_panel_info
+
+    echo
+    echo "Certificate issuance failed."
+    echo
+    echo "Check:"
+    echo
+    echo "1. DigitalOcean Firewall TCP/80"
+    echo "2. Any external firewall"
+    echo "3. Routing to ${PUBLIC_IP}"
+    echo "4. ACME log"
+    echo
+
+    exit 1
+
+fi
+
+
+echo "Certificate issuance succeeded."
+
+
+# ============================================================
+# 10. INSTALL CERTIFICATE FILES
+# ============================================================
+
+log "[10/18] Installing certificate files"
+
+
+"$ACME" \
+    --installcert \
+    --force \
+    -d "$PUBLIC_IP" \
+    --key-file "$CERT_PRIVATE" \
+    --fullchain-file "$CERT_FULLCHAIN" \
+    --reloadcmd "systemctl restart x-ui" \
+    || true
+
+
+if [[ ! -s "$CERT_FULLCHAIN" ]]; then
+
+    SSL_STATUS="FAILED: fullchain missing"
+
+    CONFIG_STATUS="FAILED"
+
+    write_panel_info
+
+    die "Certificate file missing: $CERT_FULLCHAIN"
+
+fi
+
+
+if [[ ! -s "$CERT_PRIVATE" ]]; then
+
+    SSL_STATUS="FAILED: private key missing"
+
+    CONFIG_STATUS="FAILED"
+
+    write_panel_info
+
+    die "Private key missing: $CERT_PRIVATE"
+
+fi
+
+
+chmod 644 "$CERT_FULLCHAIN"
+
+chmod 600 "$CERT_PRIVATE"
+
+
+echo "Certificate:"
+echo "$CERT_FULLCHAIN"
 
 echo
 
-echo "Created:"
-echo "$LOGIN_SCRIPT"
+echo "Private key:"
+echo "$CERT_PRIVATE"
 
 
 # ============================================================
-# STEP 8
-# RESTART x-ui
+# 11. CONFIGURE PANEL CERTIFICATE
 # ============================================================
 
-log "[8/15] Restarting x-ui before API bootstrap"
+log "[11/18] Configuring x-ui panel SSL"
+
+
+/usr/local/x-ui/x-ui cert \
+    -webCert "$CERT_FULLCHAIN" \
+    -webCertKey "$CERT_PRIVATE"
+
+
+CERT_CONFIG_RC=$?
+
+
+if [[ "$CERT_CONFIG_RC" -ne 0 ]]; then
+
+    SSL_STATUS="FAILED: x-ui cert command"
+
+    CONFIG_STATUS="FAILED"
+
+    write_panel_info
+
+    die "Could not configure panel certificate."
+
+fi
+
+
+# ============================================================
+# 12. CONFIGURE SUBSCRIPTION CERTIFICATE
+# ============================================================
+
+log "[12/18] Configuring Subscription TLS"
+
+
+# ------------------------------------------------------------
+# Set same cert for Subscription Server.
+#
+# These are normal 3x-ui settings:
+#
+#   subCertFile
+#   subKeyFile
+# ------------------------------------------------------------
+
+set_setting \
+    "subCertFile" \
+    "$CERT_FULLCHAIN" \
+    || die "Could not configure subCertFile."
+
+
+set_setting \
+    "subKeyFile" \
+    "$CERT_PRIVATE" \
+    || die "Could not configure subKeyFile."
+
+
+# Ensure subscription is enabled.
+set_setting \
+    "subEnable" \
+    "true" \
+    || true
+
+
+SSL_STATUS="SUCCESS"
+
+
+PANEL_URL="https://${PUBLIC_IP}:${XUI_PANEL_PORT}/${WEB_PATH}"
+
+
+# ============================================================
+# SAVE UPDATED CREDENTIAL FILE
+# ============================================================
+
+cat > "$RESULT_DIR/credentials.env" <<EOF
+XUI_USERNAME=${XUI_USERNAME}
+XUI_PASSWORD=${XUI_PASSWORD}
+XUI_PANEL_PORT=${XUI_PANEL_PORT}
+XUI_WEB_BASE_PATH=${XUI_WEB_BASE_PATH}
+XUI_ACCESS_URL=${PANEL_URL}
+XUI_API_TOKEN=${XUI_API_TOKEN}
+XUI_DB_TYPE=${XUI_DB_TYPE}
+XUI_CERT_FILE=${CERT_FULLCHAIN}
+XUI_CERT_KEY=${CERT_PRIVATE}
+EOF
+
+
+chmod 600 "$RESULT_DIR/credentials.env"
+
+chown root:root "$RESULT_DIR/credentials.env"
+
+
+# ============================================================
+# 13. RESTART x-ui
+# ============================================================
+
+log "[13/18] Restarting x-ui with TLS"
 
 
 systemctl restart x-ui
@@ -813,22 +1184,40 @@ sleep 5
 
 if ! systemctl is-active --quiet x-ui; then
 
-    CONFIG_STATUS="FAILED: x-ui restart"
+    CONFIG_STATUS="FAILED: x-ui restart after SSL"
 
     write_panel_info
 
-    die "x-ui failed after restart."
+
+    systemctl status x-ui \
+        --no-pager \
+        -l \
+        || true
+
+
+    exit 1
 
 fi
 
 
+echo "x-ui restarted successfully."
+
+
 # ============================================================
-# STEP 9
-# WAIT FOR PANEL TCP PORT
+# BUILD API BASE
 # ============================================================
 
-log "[9/15] Waiting for panel TCP port"
+API_BASE="https://127.0.0.1:${XUI_PANEL_PORT}/${WEB_PATH}"
 
+
+echo
+echo "API Base:"
+echo "$API_BASE"
+
+
+# ============================================================
+# WAIT FOR PANEL PORT
+# ============================================================
 
 PORT_READY=0
 
@@ -851,33 +1240,20 @@ done
 
 if [[ "$PORT_READY" -ne 1 ]]; then
 
-    CONFIG_STATUS="FAILED: panel TCP port not ready"
+    CONFIG_STATUS="FAILED: panel TCP port"
 
     write_panel_info
 
-    die "Panel TCP port ${XUI_PANEL_PORT} did not become ready."
+    die "Panel port did not become ready."
 
 fi
 
 
-echo "Panel TCP port is listening."
-
-
 # ============================================================
-# STEP 10
-# AUTHENTICATE API
-#
-# FIXED VERSION
-#
-# 1) Bearer quick test
-# 2) Login automatically
-# 3) Bearer test again
-# 4) Session + CSRF fallback
-#
-# Total wait is bounded.
+# 14. AUTHENTICATE API
 # ============================================================
 
-log "[10/15] Authenticating 3x-ui API"
+log "[14/18] Authenticating 3x-ui API"
 
 
 API_READY=0
@@ -885,11 +1261,11 @@ API_READY=0
 
 for ATTEMPT in $(seq 1 30); do
 
-    echo "API authentication attempt ${ATTEMPT}/30"
+    echo "API attempt ${ATTEMPT}/30"
 
 
     # --------------------------------------------------------
-    # A) First try Bearer directly
+    # Bearer first
     # --------------------------------------------------------
 
     RESPONSE="$(
@@ -909,14 +1285,12 @@ for ATTEMPT in $(seq 1 30); do
 
         API_READY=1
 
-        echo "API authenticated with Bearer token."
-
         break
     fi
 
 
     # --------------------------------------------------------
-    # B) Perform normal panel login
+    # Normal login
     # --------------------------------------------------------
 
     LOGIN_PAYLOAD="$(
@@ -934,8 +1308,8 @@ for ATTEMPT in $(seq 1 30); do
         curl \
             -k \
             -sS \
-            --connect-timeout 2 \
-            --max-time 8 \
+            --connect-timeout 3 \
+            --max-time 10 \
             -c "$COOKIE_JAR" \
             -H "Content-Type: application/json" \
             --data "$LOGIN_PAYLOAD" \
@@ -955,13 +1329,6 @@ for ATTEMPT in $(seq 1 30); do
             || true
 
 
-        echo "Panel login succeeded."
-
-
-        # ----------------------------------------------------
-        # C) Try Bearer again after login
-        # ----------------------------------------------------
-
         RESPONSE="$(
             api_get_bearer \
                 "/panel/api/inbounds/list" \
@@ -979,22 +1346,20 @@ for ATTEMPT in $(seq 1 30); do
 
             API_READY=1
 
-            echo "Bearer API became ready after panel login."
-
             break
         fi
 
 
         # ----------------------------------------------------
-        # D) Fallback to session + CSRF
+        # Session fallback
         # ----------------------------------------------------
 
         CSRF_RESPONSE="$(
             curl \
                 -k \
                 -sS \
-                --connect-timeout 2 \
-                --max-time 8 \
+                --connect-timeout 3 \
+                --max-time 10 \
                 -b "$COOKIE_JAR" \
                 "${API_BASE}/csrf-token" \
                 2>/dev/null \
@@ -1030,8 +1395,6 @@ for ATTEMPT in $(seq 1 30); do
 
                 API_READY=1
 
-                echo "API authenticated with Session + CSRF."
-
                 break
             fi
 
@@ -1047,51 +1410,33 @@ done
 
 if [[ "$API_READY" -ne 1 ]]; then
 
-    CONFIG_STATUS="FAILED: API authentication timeout"
+    CONFIG_STATUS="FAILED: API authentication"
 
     BOOTSTRAP_STATUS="PARTIAL_FAILURE"
 
     write_panel_info
-
-    echo
-    echo "Panel itself is installed."
-    echo "Automatic configuration was not completed."
-    echo
-    echo "Manual API test:"
-    echo
-    echo "source /etc/x-ui/install-result.env"
-    echo
-    echo 'curl -k -H "Authorization: Bearer ${XUI_API_TOKEN}" \'
-    echo '  "https://127.0.0.1:${XUI_PANEL_PORT}/${XUI_WEB_BASE_PATH}/panel/api/inbounds/list"'
-    echo
 
     exit 1
 
 fi
 
 
-echo
-echo "Selected authentication mode:"
+echo "API authentication:"
 echo "$AUTH_MODE"
 
 
 # ============================================================
-# STEP 11
-# CLEAN PREVIOUS MANAGED OBJECTS
+# 15. CLEAN PREVIOUS MANAGED CONFIG
 # ============================================================
 
-log "[11/15] Preparing managed configuration"
+log "[15/18] Preparing managed configuration"
 
-
-# ------------------------------------------------------------
-# Remove Friend if this bootstrap was run before
-# ------------------------------------------------------------
 
 DELETE_FRIEND_PAYLOAD='{
-    "emails": [
-        "Friend"
-    ],
-    "keepTraffic": false
+  "emails": [
+    "Friend"
+  ],
+  "keepTraffic": false
 }'
 
 
@@ -1102,19 +1447,11 @@ api_post \
     || true
 
 
-# ------------------------------------------------------------
-# Read existing inbounds
-# ------------------------------------------------------------
-
 CURRENT_LIST="$(
     api_get \
         "/panel/api/inbounds/list"
 )"
 
-
-# ------------------------------------------------------------
-# Delete only inbounds managed by this script
-# ------------------------------------------------------------
 
 for REMARK in \
     "insecure" \
@@ -1138,7 +1475,7 @@ do
         [[ -z "$ID" ]] && continue
 
 
-        echo "Removing previous managed inbound:"
+        echo "Removing old managed inbound:"
         echo "${REMARK} / ID ${ID}"
 
 
@@ -1186,7 +1523,7 @@ CURRENT_LIST="$(
 
 
 # ------------------------------------------------------------
-# Do NOT delete unknown services occupying our ports
+# Refuse to delete unknown inbounds on required ports.
 # ------------------------------------------------------------
 
 for PORT in 10253 443 2052 17667; do
@@ -1204,16 +1541,15 @@ for PORT in 10253 443 2052 17667; do
 
     if [[ -n "$CONFLICT" ]]; then
 
-        CONFIG_STATUS="FAILED: Port ${PORT} already used by ${CONFLICT}"
+        CONFIG_STATUS="FAILED: Port ${PORT} conflict"
 
         BOOTSTRAP_STATUS="PARTIAL_FAILURE"
 
         write_panel_info
 
-        echo
+
         echo "Port conflict:"
         echo "$CONFLICT"
-        echo
 
         exit 1
 
@@ -1223,12 +1559,8 @@ done
 
 
 # ============================================================
-# STEP 12
-# GENERATE REALITY KEYS
+# GENERATE REALITY MATERIAL
 # ============================================================
-
-log "[12/15] Generating REALITY cryptographic material"
-
 
 generate_reality_material()
 {
@@ -1255,9 +1587,7 @@ generate_reality_material()
         jq -e '.success == true' \
         >/dev/null
     then
-
         return 1
-
     fi
 
 
@@ -1284,9 +1614,7 @@ generate_reality_material()
         jq -e '.success == true' \
         >/dev/null
     then
-
         return 1
-
     fi
 
 
@@ -1331,571 +1659,471 @@ generate_reality_material()
         '%s' \
         "$mldsa_verify"
 
-
     return 0
 }
 
 
-if ! generate_reality_material "ROW"; then
-
-    CONFIG_STATUS="FAILED: ROW REALITY key generation"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
-
-fi
+log "[16/18] Generating REALITY keys"
 
 
-if ! generate_reality_material "XHTTP"; then
-
-    CONFIG_STATUS="FAILED: XHTTP REALITY key generation"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
-
-fi
+generate_reality_material "ROW" \
+    || die "ROW REALITY key generation failed."
 
 
-if ! generate_reality_material "GRPC"; then
-
-    CONFIG_STATUS="FAILED: gRPC REALITY key generation"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
-
-fi
+generate_reality_material "XHTTP" \
+    || die "XHTTP REALITY key generation failed."
 
 
-echo "REALITY keys generated successfully."
+generate_reality_material "GRPC" \
+    || die "gRPC REALITY key generation failed."
 
 
 # ============================================================
-# STEP 13
-# BUILD INBOUNDS
+# BUILD INBOUND JSON
 # ============================================================
 
-log "[13/15] Creating inbounds"
-
-
-# ============================================================
-# INBOUND 1
-# VLESS TCP NO SECURITY
-# ============================================================
 
 INBOUND_1="$(
 jq -n '
 {
-    remark: "insecure",
-    enable: true,
-    expiryTime: 0,
-    total: 0,
-    trafficReset: "never",
-    listen: "",
-    port: 10253,
-    protocol: "vless",
+  remark: "insecure",
+  enable: true,
+  expiryTime: 0,
+  total: 0,
+  trafficReset: "never",
+  listen: "",
+  port: 10253,
+  protocol: "vless",
 
-    settings: {
-        clients: [],
-        decryption: "none",
-        encryption: "none"
+  settings: {
+    clients: [],
+    decryption: "none",
+    encryption: "none"
+  },
+
+  streamSettings: {
+    network: "tcp",
+
+    tcpSettings: {
+      acceptProxyProtocol: false,
+
+      header: {
+        type: "none"
+      }
     },
 
-    streamSettings: {
+    security: "none"
+  },
 
-        network: "tcp",
+  tag: "in-10253-tcp",
 
-        tcpSettings: {
-            acceptProxyProtocol: false,
+  sniffing: {
+    enabled: false
+  },
 
-            header: {
-                type: "none"
-            }
-        },
-
-        security: "none"
-    },
-
-    tag: "in-10253-tcp",
-
-    sniffing: {
-        enabled: false
-    },
-
-    shareAddrStrategy: "listen",
-    shareAddr: "",
-    subSortIndex: 1,
-    originNodeGuid: ""
+  shareAddrStrategy: "listen",
+  shareAddr: "",
+  subSortIndex: 1,
+  originNodeGuid: ""
 }'
 )"
 
-
-# ============================================================
-# INBOUND 2
-# VLESS TCP REALITY / SAMSUNG
-# ============================================================
 
 INBOUND_2="$(
 jq -n \
-    --arg privateKey "$ROW_PRIVATE" \
-    --arg publicKey "$ROW_PUBLIC" \
-    --arg mldsaSeed "$ROW_MLDSA_SEED" \
-    --arg mldsaVerify "$ROW_MLDSA_VERIFY" \
+  --arg privateKey "$ROW_PRIVATE" \
+  --arg publicKey "$ROW_PUBLIC" \
+  --arg mldsaSeed "$ROW_MLDSA_SEED" \
+  --arg mldsaVerify "$ROW_MLDSA_VERIFY" \
 '
 {
-    remark: "Vless-Reality-Row",
-    enable: true,
-    expiryTime: 0,
-    total: 0,
-    trafficReset: "never",
-    listen: "",
-    port: 443,
-    protocol: "vless",
+  remark: "Vless-Reality-Row",
+  enable: true,
+  expiryTime: 0,
+  total: 0,
+  trafficReset: "never",
+  listen: "",
+  port: 443,
+  protocol: "vless",
 
-    settings: {
+  settings: {
+    clients: [],
+    decryption: "none",
+    encryption: "none",
 
-        clients: [],
+    testseed: [
+      900,
+      500,
+      900,
+      256
+    ]
+  },
 
-        decryption: "none",
+  streamSettings: {
 
-        encryption: "none",
+    network: "tcp",
 
-        testseed: [
-            900,
-            500,
-            900,
-            256
-        ]
+    tcpSettings: {
+
+      acceptProxyProtocol: false,
+
+      header: {
+        type: "none"
+      }
     },
 
-    streamSettings: {
+    security: "reality",
 
-        network: "tcp",
+    realitySettings: {
 
-        tcpSettings: {
+      show: false,
+      xver: 0,
 
-            acceptProxyProtocol: false,
+      target: "www.samsung.com:443",
 
-            header: {
-                type: "none"
-            }
-        },
+      serverNames: [
+        "www.samsung.com",
+        "adn-stg.yourservice.samsung.com",
+        "am-images.shop.samsung.com",
+        "ap-author.led.samsung.com",
+        "ap-author.semiconductor.samsung.com",
+        "api-stg.semiconductor.samsung.cn",
+        "api.led.samsung.com",
+        "api.semiconductor.samsung.cn",
+        "api.semiconductor.samsung.com",
+        "au-images.shop.samsung.com",
+        "au2-images.shop.samsung.com",
+        "b2bshop.samsung.com",
+        "cdn.samsung.com",
+        "cstudio.semiconductor.samsung.com",
+        "download.led.samsung.com",
+        "download.semiconductor.samsung.com",
+        "eu-images.shop.samsung.com",
+        "eventadm.semiconductor.samsung.com",
+        "eventapi.semiconductor.samsung.com",
+        "image.led.samsung.com",
+        "image.samsung.com",
+        "image.semiconductor.samsung.com",
+        "images.samsung.com",
+        "led.samsung.com",
+        "legal.samsungdm.com",
+        "mena-images.shop.samsung.com",
+        "org.semiconductor.samsung.com",
+        "perf-prod.samsung.com",
+        "pre-prod.samsung.com",
+        "qa.semiconductor.samsung.com",
+        "qapartners.sec.samsung.com",
+        "ru-images.shop.samsung.com",
+        "samsung.com",
+        "search.led.samsung.com",
+        "search.semiconductor.samsung.com",
+        "semiconductor.samsung.com",
+        "sribsrch.ecom-qa.samsung.com",
+        "sribsrch.ecom.samsung.com",
+        "stg-am-images.shop.samsung.com",
+        "stg-au-images.shop.samsung.com",
+        "stg-au2-images.shop.samsung.com",
+        "stg-eu-images.shop.samsung.com",
+        "stg-mena-images.shop.samsung.com",
+        "stg-ru-images.shop.samsung.com",
+        "streaming.samsung.com",
+        "ue-author.semiconductor.samsung.com",
+        "vdapi.samsung.com",
+        "www-ams.samsung.com",
+        "www.samsungebiz.com",
+        "www.semiconductor.samsung.com"
+      ],
 
-        security: "reality",
+      privateKey: $privateKey,
 
-        realitySettings: {
+      minClientVer: "",
+      maxClientVer: "",
+      maxTimediff: 0,
 
-            show: false,
+      shortIds: [
+        "7b",
+        "d19a",
+        "1059780f1c199b",
+        "2da42c",
+        "b2102f7fdf",
+        "8e3deee4",
+        "50922e6cff342142",
+        "a96bb07558a5"
+      ],
 
-            xver: 0,
+      mldsa65Seed: $mldsaSeed,
 
-            target: "www.samsung.com:443",
+      settings: {
+        publicKey: $publicKey,
+        fingerprint: "chrome",
+        serverName: "",
+        spiderX: "/",
+        mldsa65Verify: $mldsaVerify
+      }
+    }
+  },
 
-            serverNames: [
-                "www.samsung.com",
-                "adn-stg.yourservice.samsung.com",
-                "am-images.shop.samsung.com",
-                "ap-author.led.samsung.com",
-                "ap-author.semiconductor.samsung.com",
-                "api-stg.semiconductor.samsung.cn",
-                "api.led.samsung.com",
-                "api.semiconductor.samsung.cn",
-                "api.semiconductor.samsung.com",
-                "au-images.shop.samsung.com",
-                "au2-images.shop.samsung.com",
-                "b2bshop.samsung.com",
-                "cdn.samsung.com",
-                "cstudio.semiconductor.samsung.com",
-                "download.led.samsung.com",
-                "download.semiconductor.samsung.com",
-                "eu-images.shop.samsung.com",
-                "eventadm.semiconductor.samsung.com",
-                "eventapi.semiconductor.samsung.com",
-                "image.led.samsung.com",
-                "image.samsung.com",
-                "image.semiconductor.samsung.com",
-                "images.samsung.com",
-                "led.samsung.com",
-                "legal.samsungdm.com",
-                "mena-images.shop.samsung.com",
-                "org.semiconductor.samsung.com",
-                "perf-prod.samsung.com",
-                "pre-prod.samsung.com",
-                "qa.semiconductor.samsung.com",
-                "qapartners.sec.samsung.com",
-                "ru-images.shop.samsung.com",
-                "samsung.com",
-                "search.led.samsung.com",
-                "search.semiconductor.samsung.com",
-                "semiconductor.samsung.com",
-                "sribsrch.ecom-qa.samsung.com",
-                "sribsrch.ecom.samsung.com",
-                "stg-am-images.shop.samsung.com",
-                "stg-au-images.shop.samsung.com",
-                "stg-au2-images.shop.samsung.com",
-                "stg-eu-images.shop.samsung.com",
-                "stg-mena-images.shop.samsung.com",
-                "stg-ru-images.shop.samsung.com",
-                "streaming.samsung.com",
-                "ue-author.semiconductor.samsung.com",
-                "vdapi.samsung.com",
-                "www-ams.samsung.com",
-                "www.samsungebiz.com",
-                "www.semiconductor.samsung.com"
-            ],
+  tag: "in-443-tcp",
 
-            privateKey: $privateKey,
+  sniffing: {
+    enabled: false
+  },
 
-            minClientVer: "",
-
-            maxClientVer: "",
-
-            maxTimediff: 0,
-
-            shortIds: [
-                "7b",
-                "d19a",
-                "1059780f1c199b",
-                "2da42c",
-                "b2102f7fdf",
-                "8e3deee4",
-                "50922e6cff342142",
-                "a96bb07558a5"
-            ],
-
-            mldsa65Seed: $mldsaSeed,
-
-            settings: {
-
-                publicKey: $publicKey,
-
-                fingerprint: "chrome",
-
-                serverName: "",
-
-                spiderX: "/",
-
-                mldsa65Verify: $mldsaVerify
-            }
-        }
-    },
-
-    tag: "in-443-tcp",
-
-    sniffing: {
-        enabled: false
-    },
-
-    shareAddrStrategy: "listen",
-
-    shareAddr: "",
-
-    subSortIndex: 1,
-
-    originNodeGuid: ""
+  shareAddrStrategy: "listen",
+  shareAddr: "",
+  subSortIndex: 1,
+  originNodeGuid: ""
 }'
 )"
 
-
-# ============================================================
-# INBOUND 3
-# VLESS XHTTP REALITY / DOCKER
-# ============================================================
 
 INBOUND_3="$(
 jq -n \
-    --arg privateKey "$XHTTP_PRIVATE" \
-    --arg publicKey "$XHTTP_PUBLIC" \
-    --arg mldsaSeed "$XHTTP_MLDSA_SEED" \
-    --arg mldsaVerify "$XHTTP_MLDSA_VERIFY" \
+  --arg privateKey "$XHTTP_PRIVATE" \
+  --arg publicKey "$XHTTP_PUBLIC" \
+  --arg mldsaSeed "$XHTTP_MLDSA_SEED" \
+  --arg mldsaVerify "$XHTTP_MLDSA_VERIFY" \
 '
 {
-    remark: "Vless-Xhttp",
-    enable: true,
-    expiryTime: 0,
-    total: 0,
-    trafficReset: "never",
-    listen: "",
-    port: 2052,
-    protocol: "vless",
+  remark: "Vless-Xhttp",
+  enable: true,
+  expiryTime: 0,
+  total: 0,
+  trafficReset: "never",
+  listen: "",
+  port: 2052,
+  protocol: "vless",
 
-    settings: {
+  settings: {
+    clients: [],
+    decryption: "none",
+    encryption: "none"
+  },
 
-        clients: [],
+  streamSettings: {
 
-        decryption: "none",
+    network: "xhttp",
 
-        encryption: "none"
+    xhttpSettings: {
+      path: "/xhttp",
+      host: "",
+      mode: "auto",
+      xPaddingBytes: "100-1000",
+      scMaxBufferedPosts: 30,
+      scStreamUpServerSecs: "20-80"
     },
 
-    streamSettings: {
+    security: "reality",
 
-        network: "xhttp",
+    realitySettings: {
 
-        xhttpSettings: {
+      show: false,
+      xver: 0,
 
-            path: "/xhttp",
+      target: "www.docker.io:443",
 
-            host: "",
+      serverNames: [
+        "dockercon.com",
+        "docker.com",
+        "docs.docker.com",
+        "docker.io"
+      ],
 
-            mode: "auto",
+      privateKey: $privateKey,
 
-            xPaddingBytes: "100-1000",
+      minClientVer: "",
+      maxClientVer: "",
+      maxTimediff: 0,
 
-            scMaxBufferedPosts: 30,
+      shortIds: [
+        "7d",
+        "d556a878e8be",
+        "0c8e04",
+        "17d23956a0",
+        "201979bdc76856",
+        "c521",
+        "2f7acf5f",
+        "aa6f98d388cdef4e"
+      ],
 
-            scStreamUpServerSecs: "20-80"
-        },
+      mldsa65Seed: $mldsaSeed,
 
-        security: "reality",
+      settings: {
+        publicKey: $publicKey,
+        fingerprint: "chrome",
+        serverName: "",
+        spiderX: "/",
+        mldsa65Verify: $mldsaVerify
+      }
+    }
+  },
 
-        realitySettings: {
+  tag: "in-2052-tcp",
 
-            show: false,
+  sniffing: {
+    enabled: false
+  },
 
-            xver: 0,
-
-            target: "www.docker.io:443",
-
-            serverNames: [
-                "dockercon.com",
-                "docker.com",
-                "docs.docker.com",
-                "docker.io"
-            ],
-
-            privateKey: $privateKey,
-
-            minClientVer: "",
-
-            maxClientVer: "",
-
-            maxTimediff: 0,
-
-            shortIds: [
-                "7d",
-                "d556a878e8be",
-                "0c8e04",
-                "17d23956a0",
-                "201979bdc76856",
-                "c521",
-                "2f7acf5f",
-                "aa6f98d388cdef4e"
-            ],
-
-            mldsa65Seed: $mldsaSeed,
-
-            settings: {
-
-                publicKey: $publicKey,
-
-                fingerprint: "chrome",
-
-                serverName: "",
-
-                spiderX: "/",
-
-                mldsa65Verify: $mldsaVerify
-            }
-        }
-    },
-
-    tag: "in-2052-tcp",
-
-    sniffing: {
-        enabled: false
-    },
-
-    shareAddrStrategy: "listen",
-
-    shareAddr: "",
-
-    subSortIndex: 1,
-
-    originNodeGuid: ""
+  shareAddrStrategy: "listen",
+  shareAddr: "",
+  subSortIndex: 1,
+  originNodeGuid: ""
 }'
 )"
 
-
-# ============================================================
-# INBOUND 4
-# VLESS GRPC REALITY / K8S
-# ============================================================
 
 INBOUND_4="$(
 jq -n \
-    --arg privateKey "$GRPC_PRIVATE" \
-    --arg publicKey "$GRPC_PUBLIC" \
-    --arg mldsaSeed "$GRPC_MLDSA_SEED" \
-    --arg mldsaVerify "$GRPC_MLDSA_VERIFY" \
+  --arg privateKey "$GRPC_PRIVATE" \
+  --arg publicKey "$GRPC_PUBLIC" \
+  --arg mldsaSeed "$GRPC_MLDSA_SEED" \
+  --arg mldsaVerify "$GRPC_MLDSA_VERIFY" \
 '
 {
-    remark: "Vless-Reality-gRPC",
-    enable: true,
-    expiryTime: 0,
-    total: 0,
-    trafficReset: "never",
-    listen: "",
-    port: 17667,
-    protocol: "vless",
+  remark: "Vless-Reality-gRPC",
+  enable: true,
+  expiryTime: 0,
+  total: 0,
+  trafficReset: "never",
+  listen: "",
+  port: 17667,
+  protocol: "vless",
 
-    settings: {
+  settings: {
+    clients: [],
+    decryption: "none",
+    encryption: "none"
+  },
 
-        clients: [],
+  streamSettings: {
 
-        decryption: "none",
+    network: "grpc",
 
-        encryption: "none"
+    grpcSettings: {
+      serviceName: "",
+      authority: "",
+      multiMode: false
     },
 
-    streamSettings: {
+    security: "reality",
 
-        network: "grpc",
+    realitySettings: {
 
-        grpcSettings: {
+      show: false,
+      xver: 0,
 
-            serviceName: "",
+      target: "www.k8s.io:443",
 
-            authority: "",
+      serverNames: [
+        "k8s.io",
+        "apt.k8s.io",
+        "apt.kubernetes.io",
+        "blog.k8s.io",
+        "blog.kubernetes.io",
+        "changelog.k8s.io",
+        "changelog.kubernetes.io",
+        "ci-test.k8s.io",
+        "ci-test.kubernetes.io",
+        "code.k8s.io",
+        "code.kubernetes.io",
+        "conduct.k8s.io",
+        "conduct.kubernetes.io",
+        "docs.k8s.io",
+        "docs.kubernetes.io",
+        "examples.k8s.io",
+        "examples.kubernetes.io",
+        "feature.k8s.io",
+        "feature.kubernetes.io",
+        "features.k8s.io",
+        "features.kubernetes.io",
+        "get.k8s.io",
+        "get.kubernetes.io",
+        "git.k8s.io",
+        "git.kubernetes.io",
+        "go.k8s.io",
+        "go.kubernetes.io",
+        "issue.k8s.io",
+        "issue.kubernetes.io",
+        "issues.k8s.io",
+        "issues.kubernetes.io",
+        "kep.k8s.io",
+        "kep.kubernetes.io",
+        "packages.k8s.io",
+        "packages.kubernetes.io",
+        "pkgs.k8s.io",
+        "pkgs.kubernetes.io",
+        "pr-test.k8s.io",
+        "pr-test.kubernetes.io",
+        "pr.k8s.io",
+        "pr.kubernetes.io",
+        "prs.k8s.io",
+        "prs.kubernetes.io",
+        "rel.k8s.io",
+        "rel.kubernetes.io",
+        "releases.k8s.io",
+        "releases.kubernetes.io",
+        "sbom.k8s.io",
+        "sbom.kubernetes.io",
+        "sigs.k8s.io",
+        "sigs.kubernetes.io",
+        "slack.k8s.io",
+        "slack.kubernetes.io",
+        "submit-queue.k8s.io",
+        "submit-queue.kubernetes.io",
+        "www.k8s.io",
+        "youtube.k8s.io",
+        "youtube.kubernetes.io",
+        "yt.k8s.io",
+        "yt.kubernetes.io",
+        "yum.k8s.io",
+        "yum.kubernetes.io"
+      ],
 
-            multiMode: false
-        },
+      privateKey: $privateKey,
 
-        security: "reality",
+      minClientVer: "",
+      maxClientVer: "",
+      maxTimediff: 0,
 
-        realitySettings: {
+      shortIds: [
+        "aa5794f3",
+        "d56131ba952ffb",
+        "a1",
+        "4302",
+        "6779170a6abf3bd9",
+        "6446b6",
+        "7caf6afe05",
+        "5df0cc840553"
+      ],
 
-            show: false,
+      mldsa65Seed: $mldsaSeed,
 
-            xver: 0,
+      settings: {
+        publicKey: $publicKey,
+        fingerprint: "chrome",
+        serverName: "",
+        spiderX: "/",
+        mldsa65Verify: $mldsaVerify
+      }
+    }
+  },
 
-            target: "www.k8s.io:443",
+  tag: "in-17667-tcp",
 
-            serverNames: [
-                "k8s.io",
-                "apt.k8s.io",
-                "apt.kubernetes.io",
-                "blog.k8s.io",
-                "blog.kubernetes.io",
-                "changelog.k8s.io",
-                "changelog.kubernetes.io",
-                "ci-test.k8s.io",
-                "ci-test.kubernetes.io",
-                "code.k8s.io",
-                "code.kubernetes.io",
-                "conduct.k8s.io",
-                "conduct.kubernetes.io",
-                "docs.k8s.io",
-                "docs.kubernetes.io",
-                "examples.k8s.io",
-                "examples.kubernetes.io",
-                "feature.k8s.io",
-                "feature.kubernetes.io",
-                "features.k8s.io",
-                "features.kubernetes.io",
-                "get.k8s.io",
-                "get.kubernetes.io",
-                "git.k8s.io",
-                "git.kubernetes.io",
-                "go.k8s.io",
-                "go.kubernetes.io",
-                "issue.k8s.io",
-                "issue.kubernetes.io",
-                "issues.k8s.io",
-                "issues.kubernetes.io",
-                "kep.k8s.io",
-                "kep.kubernetes.io",
-                "packages.k8s.io",
-                "packages.kubernetes.io",
-                "pkgs.k8s.io",
-                "pkgs.kubernetes.io",
-                "pr-test.k8s.io",
-                "pr-test.kubernetes.io",
-                "pr.k8s.io",
-                "pr.kubernetes.io",
-                "prs.k8s.io",
-                "prs.kubernetes.io",
-                "rel.k8s.io",
-                "rel.kubernetes.io",
-                "releases.k8s.io",
-                "releases.kubernetes.io",
-                "sbom.k8s.io",
-                "sbom.kubernetes.io",
-                "sigs.k8s.io",
-                "sigs.kubernetes.io",
-                "slack.k8s.io",
-                "slack.kubernetes.io",
-                "submit-queue.k8s.io",
-                "submit-queue.kubernetes.io",
-                "www.k8s.io",
-                "youtube.k8s.io",
-                "youtube.kubernetes.io",
-                "yt.k8s.io",
-                "yt.kubernetes.io",
-                "yum.k8s.io",
-                "yum.kubernetes.io"
-            ],
+  sniffing: {
+    enabled: false
+  },
 
-            privateKey: $privateKey,
-
-            minClientVer: "",
-
-            maxClientVer: "",
-
-            maxTimediff: 0,
-
-            shortIds: [
-                "aa5794f3",
-                "d56131ba952ffb",
-                "a1",
-                "4302",
-                "6779170a6abf3bd9",
-                "6446b6",
-                "7caf6afe05",
-                "5df0cc840553"
-            ],
-
-            mldsa65Seed: $mldsaSeed,
-
-            settings: {
-
-                publicKey: $publicKey,
-
-                fingerprint: "chrome",
-
-                serverName: "",
-
-                spiderX: "/",
-
-                mldsa65Verify: $mldsaVerify
-            }
-        }
-    },
-
-    tag: "in-17667-tcp",
-
-    sniffing: {
-        enabled: false
-    },
-
-    shareAddrStrategy: "listen",
-
-    shareAddr: "",
-
-    subSortIndex: 1,
-
-    originNodeGuid: ""
+  shareAddrStrategy: "listen",
+  shareAddr: "",
+  subSortIndex: 1,
+  originNodeGuid: ""
 }'
 )"
 
 
 # ============================================================
-# SAVE GENERATED JSON
+# SAVE GENERATED PAYLOADS
 # ============================================================
 
 echo "$INBOUND_1" |
@@ -1919,7 +2147,7 @@ chmod 600 "$GENERATED_DIR"/*.json
 
 
 # ============================================================
-# CREATE INBOUND FUNCTION
+# CREATE INBOUND
 # ============================================================
 
 create_inbound()
@@ -1928,7 +2156,7 @@ create_inbound()
     local payload="$2"
 
     echo
-    echo "Creating inbound:"
+    echo "Creating:"
     echo "$name"
 
 
@@ -1953,93 +2181,44 @@ create_inbound()
         >/dev/null 2>&1
     then
 
-        echo
-        echo "Inbound creation failed:"
-        echo "$name"
-
         return 1
 
     fi
-
-
-    echo
-    echo "Inbound created successfully:"
-    echo "$name"
 
 
     return 0
 }
 
 
-# ============================================================
-# CREATE ALL INBOUNDS
-# ============================================================
-
-if ! create_inbound \
+create_inbound \
     "insecure" \
-    "$INBOUND_1"
-then
-
-    CONFIG_STATUS="FAILED: insecure inbound"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
-
-fi
+    "$INBOUND_1" \
+    || die "Could not create insecure inbound."
 
 
-if ! create_inbound \
+create_inbound \
     "Vless-Reality-Row" \
-    "$INBOUND_2"
-then
-
-    CONFIG_STATUS="FAILED: Vless-Reality-Row inbound"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
-
-fi
+    "$INBOUND_2" \
+    || die "Could not create Vless-Reality-Row."
 
 
-if ! create_inbound \
+create_inbound \
     "Vless-Xhttp" \
-    "$INBOUND_3"
-then
-
-    CONFIG_STATUS="FAILED: Vless-Xhttp inbound"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
-
-fi
+    "$INBOUND_3" \
+    || die "Could not create Vless-Xhttp."
 
 
-if ! create_inbound \
+create_inbound \
     "Vless-Reality-gRPC" \
-    "$INBOUND_4"
-then
-
-    CONFIG_STATUS="FAILED: Vless-Reality-gRPC inbound"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
-
-fi
+    "$INBOUND_4" \
+    || die "Could not create Vless-Reality-gRPC."
 
 
 sleep 3
 
 
 # ============================================================
-# GET INBOUND IDS
+# RESOLVE INBOUND IDs
 # ============================================================
 
 INBOUND_LIST="$(
@@ -2070,28 +2249,13 @@ get_inbound_id()
 }
 
 
-ID_INSECURE="$(
-    get_inbound_id \
-        "insecure"
-)"
+ID_INSECURE="$(get_inbound_id "insecure")"
 
+ID_ROW="$(get_inbound_id "Vless-Reality-Row")"
 
-ID_ROW="$(
-    get_inbound_id \
-        "Vless-Reality-Row"
-)"
+ID_XHTTP="$(get_inbound_id "Vless-Xhttp")"
 
-
-ID_XHTTP="$(
-    get_inbound_id \
-        "Vless-Xhttp"
-)"
-
-
-ID_GRPC="$(
-    get_inbound_id \
-        "Vless-Reality-gRPC"
-)"
+ID_GRPC="$(get_inbound_id "Vless-Reality-gRPC")"
 
 
 for VALUE in \
@@ -2103,98 +2267,76 @@ do
 
     if [[ -z "$VALUE" || "$VALUE" == "null" ]]; then
 
-        CONFIG_STATUS="FAILED: Could not resolve inbound IDs"
-        BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-        write_panel_info
-
-        exit 1
+        die "Could not resolve all inbound IDs."
 
     fi
 
 done
 
 
-echo
-echo "Inbound IDs:"
-echo
-echo "insecure            : $ID_INSECURE"
-echo "Vless-Reality-Row   : $ID_ROW"
-echo "Vless-Xhttp         : $ID_XHTTP"
-echo "Vless-Reality-gRPC  : $ID_GRPC"
-
-
 # ============================================================
-# STEP 14
-# CREATE FRIEND CLIENT
+# 17. CREATE FRIEND
 # ============================================================
 
-log "[14/15] Creating Friend client"
+log "[17/18] Creating Friend client"
 
 
 CLIENT_PAYLOAD="$(
 jq -n \
-    --arg email "$CLIENT_EMAIL" \
-    --arg uuid "$CLIENT_UUID" \
-    --arg subId "$CLIENT_SUB_ID" \
-    --arg auth "$CLIENT_AUTH" \
-    --arg password "$CLIENT_PASSWORD" \
-    --argjson totalGB "$CLIENT_TOTAL_BYTES" \
-    --argjson i1 "$ID_INSECURE" \
-    --argjson i2 "$ID_ROW" \
-    --argjson i3 "$ID_XHTTP" \
-    --argjson i4 "$ID_GRPC" \
+  --arg email "$CLIENT_EMAIL" \
+  --arg uuid "$CLIENT_UUID" \
+  --arg subId "$CLIENT_SUB_ID" \
+  --arg auth "$CLIENT_AUTH" \
+  --arg password "$CLIENT_PASSWORD" \
+  --argjson totalGB "$CLIENT_TOTAL_BYTES" \
+  --argjson i1 "$ID_INSECURE" \
+  --argjson i2 "$ID_ROW" \
+  --argjson i3 "$ID_XHTTP" \
+  --argjson i4 "$ID_GRPC" \
 '
 [
-    {
-        client: {
+  {
+    client: {
 
-            email: $email,
+      email: $email,
 
-            id: $uuid,
+      id: $uuid,
 
-            subId: $subId,
+      subId: $subId,
 
-            auth: $auth,
+      auth: $auth,
 
-            password: $password,
+      password: $password,
 
-            totalGB: $totalGB,
+      totalGB: $totalGB,
 
-            expiryTime: 0,
+      expiryTime: 0,
 
-            limitIp: 0,
+      limitIp: 0,
 
-            limitHwid: 0,
+      limitHwid: 0,
 
-            enable: true,
+      enable: true,
 
-            reset: 0,
+      reset: 0,
 
-            security: "auto",
+      security: "auto",
 
-            tgId: 0,
+      tgId: 0,
 
-            comment: ""
-        },
+      comment: ""
+    },
 
-        inboundIds: [
-            $i1,
-            $i2,
-            $i3,
-            $i4
-        ]
-    }
+    inboundIds: [
+      $i1,
+      $i2,
+      $i3,
+      $i4
+    ]
+  }
 ]
 '
 )"
-
-
-echo "$CLIENT_PAYLOAD" \
-    > "$RESULT_DIR/friend-client-payload.json"
-
-
-chmod 600 "$RESULT_DIR/friend-client-payload.json"
 
 
 CLIENT_RESPONSE="$(
@@ -2215,96 +2357,30 @@ if ! echo "$CLIENT_RESPONSE" |
     >/dev/null 2>&1
 then
 
-    CONFIG_STATUS="FAILED: Friend creation"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
+    die "Friend client creation failed."
 
 fi
 
 
 # ============================================================
-# VERIFY FRIEND
+# 18. SUBSCRIPTION
 # ============================================================
 
-sleep 3
+log "[18/18] Building Friend subscription"
 
 
-CLIENT_EXPORT="$(
-    api_get \
-        "/panel/api/clients/export"
-)"
+SUB_PORT="$(get_setting "subPort")"
 
+SUB_PATH="$(get_setting "subPath")"
 
-if ! echo "$CLIENT_EXPORT" |
-    jq -e \
-        --arg email "$CLIENT_EMAIL" \
-        '.obj[]? |
-         select(.client.email == $email)' \
-    >/dev/null
-then
-
-    CONFIG_STATUS="FAILED: Friend verification"
-    BOOTSTRAP_STATUS="PARTIAL_FAILURE"
-
-    write_panel_info
-
-    exit 1
-
-fi
-
-
-echo "Friend verified."
-
-
-# ============================================================
-# STEP 15
-# BUILD SUBSCRIPTION URL
-# ============================================================
-
-log "[15/15] Building Friend subscription URL"
-
-
-SUB_ENABLE="$(
-    get_setting \
-        "subEnable"
-)"
-
-SUB_PORT="$(
-    get_setting \
-        "subPort"
-)"
-
-SUB_PATH="$(
-    get_setting \
-        "subPath"
-)"
-
-SUB_DOMAIN="$(
-    get_setting \
-        "subDomain"
-)"
-
-SUB_CERT="$(
-    get_setting \
-        "subCertFile"
-)"
-
-SUB_KEY="$(
-    get_setting \
-        "subKeyFile"
-)"
+SUB_DOMAIN="$(get_setting "subDomain")"
 
 
 SUB_PORT="${SUB_PORT:-2096}"
 
 
 if [[ -z "$SUB_PATH" ]]; then
-
     SUB_PATH="/sub/"
-
 fi
 
 
@@ -2314,98 +2390,13 @@ SUB_PATH="${SUB_PATH%/}/"
 
 
 if [[ -n "$SUB_DOMAIN" ]]; then
-
     SUB_HOST="$SUB_DOMAIN"
-
 else
-
     SUB_HOST="$PUBLIC_IP"
-
 fi
 
 
-# ============================================================
-# DETECT SUBSCRIPTION PROTOCOL
-# ============================================================
-
-SUB_SCHEME="http"
-
-
-HTTPS_CODE="$(
-    curl \
-        -k \
-        -sS \
-        -o /dev/null \
-        -w '%{http_code}' \
-        --connect-timeout 3 \
-        --max-time 6 \
-        "https://127.0.0.1:${SUB_PORT}${SUB_PATH}${CLIENT_SUB_ID}" \
-        2>/dev/null \
-        || true
-)"
-
-
-if [[ \
-    "$HTTPS_CODE" =~ ^[0-9]{3}$ && \
-    "$HTTPS_CODE" != "000" \
-]]
-then
-
-    SUB_SCHEME="https"
-
-else
-
-    HTTP_CODE="$(
-        curl \
-            -sS \
-            -o /dev/null \
-            -w '%{http_code}' \
-            --connect-timeout 3 \
-            --max-time 6 \
-            "http://127.0.0.1:${SUB_PORT}${SUB_PATH}${CLIENT_SUB_ID}" \
-            2>/dev/null \
-            || true
-    )"
-
-
-    if [[ \
-        "$HTTP_CODE" =~ ^[0-9]{3}$ && \
-        "$HTTP_CODE" != "000" \
-    ]]
-    then
-
-        SUB_SCHEME="http"
-
-    fi
-
-fi
-
-
-# ============================================================
-# CONSTRUCT SUBSCRIPTION URL
-# ============================================================
-
-if [[ \
-    "$SUB_SCHEME" == "https" && \
-    "$SUB_PORT" == "443" \
-]]
-then
-
-    SUBSCRIPTION_URL="${SUB_SCHEME}://${SUB_HOST}${SUB_PATH}${CLIENT_SUB_ID}"
-
-elif [[ \
-    "$SUB_SCHEME" == "http" && \
-    "$SUB_PORT" == "80" \
-]]
-then
-
-    SUBSCRIPTION_URL="${SUB_SCHEME}://${SUB_HOST}${SUB_PATH}${CLIENT_SUB_ID}"
-
-else
-
-    SUBSCRIPTION_URL="${SUB_SCHEME}://${SUB_HOST}:${SUB_PORT}${SUB_PATH}${CLIENT_SUB_ID}"
-
-fi
+SUBSCRIPTION_URL="https://${SUB_HOST}:${SUB_PORT}${SUB_PATH}${CLIENT_SUB_ID}"
 
 
 echo
@@ -2415,11 +2406,11 @@ echo "$SUBSCRIPTION_URL"
 echo
 
 
-# ============================================================
-# TEST SUBSCRIPTION LOCALLY
-# ============================================================
+# ------------------------------------------------------------
+# Local subscription test
+# ------------------------------------------------------------
 
-LOCAL_SUB_URL="${SUB_SCHEME}://127.0.0.1:${SUB_PORT}${SUB_PATH}${CLIENT_SUB_ID}"
+LOCAL_SUB_URL="https://127.0.0.1:${SUB_PORT}${SUB_PATH}${CLIENT_SUB_ID}"
 
 
 SUB_HTTP_CODE="$(
@@ -2458,7 +2449,7 @@ CLIENT_SUB_ID=${CLIENT_SUB_ID}
 CLIENT_AUTH=${CLIENT_AUTH}
 CLIENT_PASSWORD=${CLIENT_PASSWORD}
 CLIENT_TOTAL_BYTES=${CLIENT_TOTAL_BYTES}
-SUBSCRIPTION_SCHEME=${SUB_SCHEME}
+SUBSCRIPTION_SCHEME=https
 SUBSCRIPTION_HOST=${SUB_HOST}
 SUBSCRIPTION_PORT=${SUB_PORT}
 SUBSCRIPTION_PATH=${SUB_PATH}
@@ -2472,11 +2463,8 @@ chown root:root "$RESULT_DIR/client-info.env"
 
 
 # ============================================================
-# FINAL RESTART
+# FINAL VALIDATION
 # ============================================================
-
-log "Final validation"
-
 
 systemctl restart x-ui
 
@@ -2486,27 +2474,16 @@ sleep 5
 
 if ! systemctl is-active --quiet x-ui; then
 
-    CONFIG_STATUS="FAILED: x-ui stopped after final configuration"
+    CONFIG_STATUS="FAILED: final x-ui restart"
 
     BOOTSTRAP_STATUS="PARTIAL_FAILURE"
 
     write_panel_info
 
-
-    systemctl status x-ui \
-        --no-pager \
-        -l \
-        || true
-
-
     exit 1
 
 fi
 
-
-# ============================================================
-# FINAL API TEST
-# ============================================================
 
 FINAL_LIST="$(
     api_get \
@@ -2516,40 +2493,19 @@ FINAL_LIST="$(
 )"
 
 
-if echo "$FINAL_LIST" |
-    jq -e '.success == true' \
-    >/dev/null 2>&1
-then
-
-    echo "$FINAL_LIST" |
-        jq . \
-        > "$RESULT_DIR/inbounds.json"
-
-fi
-
-
-chmod 600 "$RESULT_DIR/inbounds.json" \
-    2>/dev/null \
-    || true
-
-
-# ============================================================
-# VERIFY EXPECTED INBOUNDS
-# ============================================================
-
 EXPECTED_COUNT="$(
     echo "$FINAL_LIST" |
     jq '
-        [
-            .obj[]? |
-            select(
-                .remark == "insecure" or
-                .remark == "Vless-Reality-Row" or
-                .remark == "Vless-Xhttp" or
-                .remark == "Vless-Reality-gRPC"
-            )
-        ] |
-        length
+      [
+        .obj[]? |
+        select(
+          .remark == "insecure" or
+          .remark == "Vless-Reality-Row" or
+          .remark == "Vless-Xhttp" or
+          .remark == "Vless-Reality-gRPC"
+        )
+      ] |
+      length
     ' \
     2>/dev/null \
     || echo 0
@@ -2558,7 +2514,7 @@ EXPECTED_COUNT="$(
 
 if [[ "$EXPECTED_COUNT" != "4" ]]; then
 
-    CONFIG_STATUS="FAILED: expected 4 managed inbounds, found ${EXPECTED_COUNT}"
+    CONFIG_STATUS="FAILED: expected 4 inbounds, found ${EXPECTED_COUNT}"
 
     BOOTSTRAP_STATUS="PARTIAL_FAILURE"
 
@@ -2569,28 +2525,11 @@ if [[ "$EXPECTED_COUNT" != "4" ]]; then
 fi
 
 
-# ============================================================
-# LISTENING PORTS
-# ============================================================
-
-echo
-echo "Listening ports:"
-echo
-
-
-ss -lntp |
-    grep -E \
-        ':(443|2052|10253|17667|2096)[[:space:]]' \
-    || true
-
-
-# ============================================================
-# FINAL SUCCESS STATUS
-# ============================================================
-
 BOOTSTRAP_STATUS="COMPLETED"
 
 CONFIG_STATUS="SUCCESS"
+
+SSL_STATUS="SUCCESS"
 
 
 write_panel_info
@@ -2603,13 +2542,13 @@ write_panel_info
 log "INSTALLATION COMPLETED"
 
 
-echo "Server IP:"
+echo "Public IP:"
 echo "$PUBLIC_IP"
 
 echo
 
 echo "Panel:"
-echo "$XUI_ACCESS_URL"
+echo "$PANEL_URL"
 
 echo
 
@@ -2623,34 +2562,27 @@ echo "$XUI_PASSWORD"
 
 echo
 
-echo "Friend Subscription:"
+echo "Subscription:"
 echo "$SUBSCRIPTION_URL"
 
 echo
 
-echo "------------------------------------------------------------"
+echo "Certificate:"
+echo "$CERT_FULLCHAIN"
 
 echo
 
 echo "Configured inbounds:"
-
 echo
 
 echo "10253  VLESS / TCP / none"
-
 echo "443    VLESS / TCP / REALITY"
-
 echo "2052   VLESS / XHTTP / REALITY"
-
 echo "17667  VLESS / gRPC / REALITY"
 
 echo
 
-echo "------------------------------------------------------------"
-
-echo
-
-echo "Panel information:"
+echo "Panel info:"
 echo "/opt/x-ui/panel-info.txt"
 
 echo
@@ -2660,26 +2592,15 @@ echo "/opt/x-ui/credentials.env"
 
 echo
 
-echo "Friend client:"
+echo "Client info:"
 echo "/opt/x-ui/client-info.env"
 
 echo
 
-echo "Inbound snapshot:"
-echo "/opt/x-ui/inbounds.json"
-
-echo
-
-echo "Generated inbounds:"
-echo "/opt/x-ui/generated-inbounds/"
-
-echo
-
-echo "Bootstrap log:"
+echo "Log:"
 echo "/var/log/x-ui-bootstrap.log"
 
 echo
-
 echo "============================================================"
 echo "DONE"
 echo "============================================================"
