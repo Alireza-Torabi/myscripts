@@ -222,18 +222,51 @@ if [[ -n "${SSH_CONNECTION:-}" && $- == *i* ]]; then
   echo "################################################################"
   echo
   [[ -r /opt/x-ui/panel-info.txt ]] && cat /opt/x-ui/panel-info.txt || echo "/opt/x-ui/panel-info.txt not found."
+
   echo
   echo "################################################################"
   echo "#                    3x-ui CREDENTIALS                         #"
   echo "################################################################"
   echo
   [[ -r /opt/x-ui/credentials.env ]] && cat /opt/x-ui/credentials.env || echo "/opt/x-ui/credentials.env not found."
+
+  echo
+  echo "################################################################"
+  echo "#                 FRIEND SUBSCRIPTION QR                       #"
+  echo "################################################################"
+  echo
+
+  if [[ -r /opt/x-ui/client-info.env ]]; then
+    # shellcheck disable=SC1091
+    source /opt/x-ui/client-info.env
+
+    if [[ -n "${SUBSCRIPTION_URL:-}" ]]; then
+      echo "Subscription URL:"
+      echo
+      echo "$SUBSCRIPTION_URL"
+      echo
+
+      if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t ANSIUTF8 -m 1 "$SUBSCRIPTION_URL"
+      else
+        echo "qrencode is not installed."
+      fi
+    else
+      echo "SUBSCRIPTION_URL not found in /opt/x-ui/client-info.env"
+    fi
+  else
+    echo "/opt/x-ui/client-info.env not found."
+  fi
+
+  echo
+  echo "################################################################"
   echo
   echo "Useful commands:"
   echo "  cat /opt/x-ui/panel-info.txt"
   echo "  cat /opt/x-ui/credentials.env"
   echo "  cat /opt/x-ui/client-info.env"
   echo "  cat /opt/x-ui/inbounds.json"
+  echo '  source /opt/x-ui/client-info.env && qrencode -t ANSIUTF8 -m 1 "$SUBSCRIPTION_URL"'
   echo "  tail -n 200 /var/log/x-ui-bootstrap.log"
   echo "  systemctl status x-ui"
   echo "  x-ui"
@@ -322,7 +355,7 @@ done
 
 log "[2/18] Installing dependencies"
 apt-get update -y || die "apt-get update failed"
-apt-get install -y curl jq sqlite3 ca-certificates openssl uuid-runtime iproute2 socat cron \
+apt-get install -y curl jq sqlite3 ca-certificates openssl uuid-runtime iproute2 socat cron qrencode \
   || die "Dependency installation failed"
 
 log "[3/18] Detecting public IPv4"
